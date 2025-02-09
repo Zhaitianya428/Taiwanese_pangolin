@@ -1,0 +1,362 @@
+// This script implements the 'this study' model described in Kyriazis et al. 2023 AmNat assuming human genomic parameters
+initialize() {
+
+	// for computational efficiency, dont model neutral(synonymous) mutations here and rescale mutation rate accordingly
+	// Huber et al 2017 estimate a 1:2.31 ratio of synonymous to nonsynonymous mutations
+	// neutral mutations could be added in by removing rescaling factor and adding in a neutral mutation type below
+	// or by using tree sequences - see SLiM manual for details on tree sequence recording
+	initializeMutationRate(1.47e-8*2.31/3.31);
+	
+	// set dominance coefficients for different deleterious mutation types (moose)
+	defineConstant("h_wkDel", 0.45);
+	defineConstant("h_modDel", 0.2);
+	defineConstant("h_strDel", 0.05);
+	defineConstant("h_semiLet", 0.0);
+	defineConstant("h_let", 0.0);
+	
+	// set up discrete DFE with four mutation types coming from gamma DFE
+	// augmented with recessive lethals
+	// this approach for implementing an h-s relationship is much faster than using fitness callbacks in SLiM (see manual)
+	initializeMutationType("m1", h_wkDel, "s", "do x=rgamma(1,-0.01314833,0.186); while (x < -0.001); return x;");
+	initializeMutationType("m2", h_modDel, "s", "do x=rgamma(1,-0.01314833,0.186); while (x < -0.01 | x >= -0.001); return x;");
+	initializeMutationType("m3", h_strDel, "s", "do x=rgamma(1,-0.01314833,0.186); while (x < -0.1 | x >= -0.01); return x;");
+	initializeMutationType("m4", h_semiLet, "s", "do x=rgamma(1,-0.01314833,0.186); while (x >= -0.1); return x;");
+	initializeMutationType("m5", h_let,"f", -1.0);
+
+        // proportion of new deleterious mutations that are recessive lethal
+	defineConstant("let_frac", 0.003);
+	
+	// set proportion of each mutation type as determined by Kim 2017 DFE augmented with lethals
+	initializeGenomicElementType("g1", c(m1,m2,m3,m4,m5), c(0.491*(1-let_frac), 0.247*(1-let_frac), 0.236*(1-let_frac), 0.026*(1-let_frac), let_frac));
+	
+	defineConstant("sampleSize", 100); //for sampling the pop for summary stats	
+	
+	//number of genes on each autosome from vaquita annotations
+	gene_vec=c(1770,1670,1660,1380,1370,1330,1090,1050,1010,970,930,920,880,730,690,670,500,490,450,230,210);
+	
+	//assume gene length of 1500bp
+	defineConstant("geneLength", 1500);
+	
+	defineConstant("seqLength", sum(gene_vec)*geneLength);
+	
+	gene_num=sum(gene_vec);
+	
+	for (i in 1:gene_num){
+		initializeGenomicElement(g1, ((i-1)*geneLength)+(i-1), (i*geneLength)+(i-2) );
+	}
+	
+	rates=NULL;
+	
+	//assume no recombination within genes, a rate of 1e-3 between genes, and free recombination between chroms
+	for (i in 1:(size(gene_vec)-1)){
+		rates=c(rates, 0, rep(c(1e-3, 0), asInteger(gene_vec[i-1]-1)), 0.5);
+	}
+	rates=c(rates, 0, rep(c(1e-3, 0), asInteger(gene_vec[size(gene_vec)-1]-1)));
+	
+	ends=NULL;
+	for (i in 1:gene_num){
+		ends=c(ends, (i*geneLength)+(i-2), (i*geneLength)+(i-1));
+	}
+	ends=ends[0:(size(ends)-2)];
+	
+	initializeRecombinationRate(rates, ends);
+}
+
+// define function getStats that randomly samples a subpopulation for sampSize # of inds and outputs a string of: 
+// pop size, mean fitness, heterozygosity, mean Froh, and avg num of variants of different classes per individual (very str del, str del, mod del, wk del)
+
+function (s) getStats(o pop, i sampSize)
+{
+	i = sample(pop.individuals, sampSize, F);
+	
+	m = sortBy(i.genomes.mutations, "position"); //get all mutations in sample
+	m_uniq = unique(m); // get rid of redundant muts
+	DAF = sapply(m_uniq, "sum(m == applyValue);"); // count number of each mut in pop
+	m_uniq_polym = m_uniq[DAF != i.genomes.size()]; //remove fixed mutations??
+	
+	//initialize vectors
+	ROH_length_sumPerInd_500kb = c();
+	ROH_length_sumPerInd_100kb = c();
+	Num_lethal_muts = c();
+	Num_sublet_muts = c();
+	Num_strDel_muts = c();
+	Num_modDel_muts = c();
+	Num_wkDel_muts = c();
+	ind_het = c();
+        fitness_population = c();
+        Num_chunhe_uniquemuts_population = c();
+	
+	for (individual in i) {
+		
+		indm = sortBy(individual.genomes.mutations, "position");
+		indm = indm[match(indm, m_uniq_polym) >= 0];   // Check that individual mutations are not fixed 
+		indm_uniq = unique(indm);
+		
+		genotype = sapply(indm_uniq, "sum(indm == applyValue);");
+		
+		// tally number of mutations for different classes of selection coefficient per individual
+		s = individual.genomes.mutations.selectionCoeff;
+		
+                //endangered vaquita
+		Num_lethal_muts = c(Num_lethal_muts, sum(s<=-0.5));
+		Num_sublet_muts = c(Num_sublet_muts, sum(s<=-0.1));
+		Num_strDel_muts = c(Num_strDel_muts, sum(s<=-0.01));
+		Num_modDel_muts = c(Num_modDel_muts, sum(s<=-0.001 & s > -0.01));
+		Num_wkDel_muts = c(Num_wkDel_muts, sum(s<=-0.00001 & s > -0.001));
+
+		if (isNULL(genotype)) {
+			ind_het = c(ind_het, 0); //putting this here to avoid error when trying to sum null vector
+			next;
+		}
+		
+		ind_het = c(ind_het, sum(genotype==1)/(seqLength));
+		
+		//code for getting ROHs
+		
+		ID_het = (genotype == 1); //outputs T/F for genotypes if they are het or homDer
+		ID_homDer = (genotype == 2);
+		pos_het = indm_uniq.position[ID_het]; //outputs positions of heterozgoys genotypes
+			
+		startpos = c(0, pos_het); //adds 0 to beggining of vector of hets
+		endpos = c(pos_het, sim.chromosome.lastPosition); //adds last position in genome to vector of hets
+		pos_het_diff = endpos - startpos;
+		
+		//sum for ROHs > 500kb
+                ROH_startpos_500kb = startpos[pos_het_diff > 500000]; //filter out startpos that dont correspond to ROH > 500kb
+		ROH_endpos_500kb = endpos[pos_het_diff > 500000];
+		ROH_length_500kb = pos_het_diff[pos_het_diff > 500000]; //vector of ROHs for each individual	
+		ROH_length_sum_500kb = sum(ROH_length_500kb);
+		ROH_length_sumPerInd_500kb = c(ROH_length_sumPerInd_500kb, ROH_length_sum_500kb); // add sum of ROHs for each individual to vector of ROHs for all individuals
+		
+		//sum for ROHs > 100kb
+                ROH_startpos_100kb = startpos[pos_het_diff > 100000]; //filter out startpos that dont correspond to ROH > 100kb
+		ROH_endpos_100kb = endpos[pos_het_diff > 100000];
+		ROH_length_100kb = pos_het_diff[pos_het_diff > 100000]; //vector of ROHs for each individual	
+		ROH_length_sum_100kb = sum(ROH_length_100kb);
+		ROH_length_sumPerInd_100kb = c(ROH_length_sumPerInd_100kb, ROH_length_sum_100kb); // add sum of ROHs for each individual to vector of ROHs for all individuals
+	
+		// calculate individual fitness - code from Bernard	
+		
+                allmuts = c(individual.genomes[0].mutationsOfType(m3),individual.genomes[1].mutationsOfType(m3),individual.genomes[0].mutationsOfType(m4),individual.genomes[1].mutationsOfType(m4),individual.genomes[0].mutationsOfType(m5),individual.genomes[1].mutationsOfType(m5));
+		uniquemuts = c(individual.uniqueMutationsOfType(m3),individual.uniqueMutationsOfType(m4),individual.uniqueMutationsOfType(m5));
+                
+                fitness_individual = c();
+                Num_chunhe_uniquemuts_individual = c();
+                
+                if (size(uniquemuts) > 0){
+                        for (u in uniquemuts){
+                                places = (allmuts.id == u.id);
+                                uu = allmuts[places];
+                                if (size(uu) == 2) {
+                                        fitness = 1 + sum(uu.selectionCoeff)/2;
+                                        Num_chunhe_uniquemuts = 1;
+                                } else if (size(uu) == 1) {
+                                        if (u.mutationType == m3){
+                                                fitness = 1 + uu.selectionCoeff * h_strDel;
+                                                Num_chunhe_uniquemuts = 0;
+                                        }
+                                        if (u.mutationType == m4){
+                                                fitness = 1 + uu.selectionCoeff * h_semiLet;
+                                                Num_chunhe_uniquemuts = 0;
+                                        }
+                                        if (u.mutationType == m5){
+                                                fitness = 1 + uu.selectionCoeff * h_let;
+                                                Num_chunhe_uniquemuts = 0;
+                                        }
+                                }
+                                fitness_individual = c(fitness_individual, fitness);
+                                Num_chunhe_uniquemuts_individual = c(Num_chunhe_uniquemuts_individual, Num_chunhe_uniquemuts);
+                        }
+                        fitness_individual = product(fitness_individual);
+                        Num_chunhe_uniquemuts_individual = sum(Num_chunhe_uniquemuts_individual);
+                        fitness_population = c(fitness_population, fitness_individual);
+                        Num_chunhe_uniquemuts_population = c(Num_chunhe_uniquemuts_population, Num_chunhe_uniquemuts_individual);
+                } else {
+                        fitness_population = c(fitness_population, 1);
+                        Num_chunhe_uniquemuts_population = c(Num_chunhe_uniquemuts_population, 0);
+                }
+
+        }	
+	return(mean(fitness_population) + "," + mean(Num_chunhe_uniquemuts_population) + "," + mean(ind_het) + "," + mean(ROH_length_sumPerInd_500kb)/seqLength + "," + mean(ROH_length_sumPerInd_100kb)/seqLength + "," + mean(Num_lethal_muts) + "," + mean(Num_sublet_muts) + "," + mean(Num_strDel_muts)+ "," + mean(Num_modDel_muts) + "," + mean(Num_wkDel_muts));
+}
+
+// simple constant size demography with N=9000
+// can make this demography arbitrarily complex as described in the SLiM manual
+1  early() {
+	sim.addSubpop("p1", 9000);
+	cat("gen,popSize,Fitness,inbLoad,lethal_seg,sublet_seg,strDel_seg,modDel_seg,wkDel_seg,lethal_fix,sublet_fix,strDel_fix,modDel_fix,wkDel_fix,meanFitness,mean_chunhe_uniquemuts,meanHet,FROH_500kb,FROH_100kb,avg_lethal,avg_sublet,avg_strDel,avg_modDel,avg_wkDel" + "\n");
+
+	// keep fixed mutations to model drift load
+	// removing them (changing this to "T") would speed up simulation
+	// but ignore effect of fixed mutations
+	m1.convertToSubstitution = F;
+	m2.convertToSubstitution = F;
+	m3.convertToSubstitution = F;
+	m4.convertToSubstitution = F;
+	m5.convertToSubstitution = F;
+
+}
+
+// maybe run simulation for 10*N generations
+// long enough for weakly deleterious mutations to reach equilibrium
+1:10000 early() {
+	p1.fitnessScaling = 9000 / p1.individualCount;
+	// output statistics every 1000 generations
+	if (sim.cycle % 1000 == 0) {
+		
+		//get segregating muts
+		muts=sim.mutations;
+		freq = p1.genomes.mutationFrequenciesInGenomes(muts);
+		seg = muts[freq != 1.0];
+		
+		lethal_seg = muts[muts.selectionCoeff <= -0.5 ];
+		sublet_seg = muts[muts.selectionCoeff <= -0.1 ];
+		strDel_seg = muts[muts.selectionCoeff <= -0.01 ];
+		modDel_seg = muts[muts.selectionCoeff <= -0.001 & muts.selectionCoeff > -0.01 ];
+		wkDel_seg = muts[muts.selectionCoeff <= -0.00001 & muts.selectionCoeff > -0.001];
+		
+		//get fixed muts
+		fixed = muts[freq == 1.0];
+		
+		lethal_fix = fixed[fixed.selectionCoeff <= -0.5 ];
+		sublet_fix = fixed[fixed.selectionCoeff <= -0.1 ];
+		strDel_fix = fixed[fixed.selectionCoeff <= -0.01 ];
+		modDel_fix = fixed[fixed.selectionCoeff <= -0.001 & fixed.selectionCoeff > -0.01 ];
+		wkDel_fix = fixed[fixed.selectionCoeff <= -0.00001 & fixed.selectionCoeff > -0.001];
+
+	        Fitness = mean(p1.cachedFitness(NULL));
+
+		// calculate inbreeding load
+		q = p1.genomes.mutationFrequenciesInGenomes(muts);
+		s = -muts.selectionCoeff;
+
+		// replace mutations with s>1.0 with 1.0 (can happen when drawing from gamma distribution)
+		s[s>1.0]=1.0;
+		
+		// get h for each mutation
+		// note that this will not work if changing h using fitness callbacks
+		h=muts.mutationType.dominanceCoeff;
+		
+		// calculate number of diploid lethal equivalents (2B or inbreeding load)
+		// equation from Morton et al 1956
+		// note that this equation assumes random mating
+		inbreeding_load = 2*(sum(q*s)-sum(q^2*s)-2*sum(q*(1-q)*s*h));
+		
+                stats = getStats(p1, sampleSize);
+                
+		cat(sim.cycle + "," + p1.individuals.size() + "," + Fitness + "," + inbreeding_load + "," + lethal_seg.length() + "," + sublet_seg.length() + "," + strDel_seg.length() + "," + modDel_seg.length() + "," + wkDel_seg.length() + "," + lethal_fix.length() + "," + sublet_fix.length() + "," + strDel_fix.length() + "," + modDel_fix.length() + "," + wkDel_fix.length() + "," + stats + "\n");
+	
+	}
+}
+
+// popsize become 200 after 10000 generations
+10001 early() {
+	p1.setSubpopulationSize(200);
+}
+
+// maybe run simulation for 10*N generations
+// long enough for weakly deleterious mutations to reach equilibrium
+10001:10060 early() {
+	p1.fitnessScaling = 200 / p1.individualCount;
+	// output statistics every 10 generations
+	if (sim.cycle % 10 == 0) {
+		
+		//get segregating muts
+		muts=sim.mutations;
+		freq = p1.genomes.mutationFrequenciesInGenomes(muts);
+		seg = muts[freq != 1.0];
+		
+		lethal_seg = muts[muts.selectionCoeff <= -0.5 ];
+		sublet_seg = muts[muts.selectionCoeff <= -0.1 ];
+		strDel_seg = muts[muts.selectionCoeff <= -0.01 ];
+		modDel_seg = muts[muts.selectionCoeff <= -0.001 & muts.selectionCoeff > -0.01 ];
+		wkDel_seg = muts[muts.selectionCoeff <= -0.00001 & muts.selectionCoeff > -0.001];
+		
+		//get fixed muts
+		fixed = muts[freq == 1.0];
+		
+		lethal_fix = fixed[fixed.selectionCoeff <= -0.5 ];
+		sublet_fix = fixed[fixed.selectionCoeff <= -0.1 ];
+		strDel_fix = fixed[fixed.selectionCoeff <= -0.01 ];
+		modDel_fix = fixed[fixed.selectionCoeff <= -0.001 & fixed.selectionCoeff > -0.01 ];
+		wkDel_fix = fixed[fixed.selectionCoeff <= -0.00001 & fixed.selectionCoeff > -0.001];
+
+		Fitness = mean(p1.cachedFitness(NULL));
+                
+                // calculate inbreeding load
+		q = p1.genomes.mutationFrequenciesInGenomes(muts);
+		s = -muts.selectionCoeff;
+
+		// replace mutations with s>1.0 with 1.0 (can happen when drawing from gamma distribution)
+		s[s>1.0]=1.0;
+		
+		// get h for each mutation
+		// note that this will not work if changing h using fitness callbacks
+		h=muts.mutationType.dominanceCoeff;
+		
+		// calculate number of diploid lethal equivalents (2B or inbreeding load)
+		// equation from Morton et al 1956
+		// note that this equation assumes random mating
+		inbreeding_load = 2*(sum(q*s)-sum(q^2*s)-2*sum(q*(1-q)*s*h));
+		
+                stats = getStats(p1, sampleSize);
+                
+		cat(sim.cycle + "," + p1.individuals.size() + "," + Fitness + "," + inbreeding_load + "," + lethal_seg.length()  + "," + sublet_seg.length() + "," + strDel_seg.length() + "," + modDel_seg.length() + "," + wkDel_seg.length() + "," + lethal_fix.length() + "," + sublet_fix.length() + "," + strDel_fix.length() + "," + modDel_fix.length() + "," + wkDel_fix.length() + "," + stats + "\n");
+	
+	}
+}
+
+// maybe run simulation for 10*N generations
+// long enough for weakly deleterious mutations to reach equilibrium
+10061:10160 early() {
+	t = sim.cycle - 10061;
+	p1_size = round(200 * (1 + 0.01)^t);
+	p1.setSubpopulationSize(asInteger(p1_size));
+	p1.fitnessScaling = 200 / p1.individualCount;
+        // output statistics every 10 generations
+	if (sim.cycle % 10 == 0) {
+		
+		//get segregating muts
+		muts=sim.mutations;
+		freq = p1.genomes.mutationFrequenciesInGenomes(muts);
+		seg = muts[freq != 1.0];
+		
+		lethal_seg = muts[muts.selectionCoeff <= -0.5 ];
+		sublet_seg = muts[muts.selectionCoeff <= -0.1 ];
+		strDel_seg = muts[muts.selectionCoeff <= -0.01 ];
+		modDel_seg = muts[muts.selectionCoeff <= -0.001 & muts.selectionCoeff > -0.01 ];
+		wkDel_seg = muts[muts.selectionCoeff <= -0.00001 & muts.selectionCoeff > -0.001];
+		
+		//get fixed muts
+		fixed = muts[freq == 1.0];
+		
+		lethal_fix = fixed[fixed.selectionCoeff <= -0.5 ];
+		sublet_fix = fixed[fixed.selectionCoeff <= -0.1 ];
+		strDel_fix = fixed[fixed.selectionCoeff <= -0.01 ];
+		modDel_fix = fixed[fixed.selectionCoeff <= -0.001 & fixed.selectionCoeff > -0.01 ];
+		wkDel_fix = fixed[fixed.selectionCoeff <= -0.00001 & fixed.selectionCoeff > -0.001];
+
+	        Fitness = mean(p1.cachedFitness(NULL));
+
+		// calculate inbreeding load
+		q = p1.genomes.mutationFrequenciesInGenomes(muts);
+		s = -muts.selectionCoeff;
+
+		// replace mutations with s>1.0 with 1.0 (can happen when drawing from gamma distribution)
+		s[s>1.0]=1.0;
+		
+		// get h for each mutation
+		// note that this will not work if changing h using fitness callbacks
+		h=muts.mutationType.dominanceCoeff;
+		
+		// calculate number of diploid lethal equivalents (2B or inbreeding load)
+		// equation from Morton et al 1956
+		// note that this equation assumes random mating
+		inbreeding_load = 2*(sum(q*s)-sum(q^2*s)-2*sum(q*(1-q)*s*h));
+		
+                stats = getStats(p1, sampleSize);
+                
+		cat(sim.cycle + "," + p1.individuals.size() + "," + Fitness + "," + inbreeding_load + "," + lethal_seg.length() + "," + sublet_seg.length() + "," + strDel_seg.length() + "," + modDel_seg.length() + "," + wkDel_seg.length() + "," + lethal_fix.length() + "," + sublet_fix.length() + "," + strDel_fix.length() + "," + modDel_fix.length() + "," + wkDel_fix.length() + "," + stats + "\n");
+	
+	}
+}
